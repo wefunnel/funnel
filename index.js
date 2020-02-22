@@ -10,6 +10,7 @@ const { EventEmitter } = require('events')
 const fetch = require('node-fetch')
 const { Aes, PublicKey, ...ecc} = require('eosjs-ecc')
 const { Long } = require('bytebuffer')
+const axios = require('axios')
 
 const rpc = new JsonRpc(process.env.EOS_RPC_URL, { fetch })
 const api = new Api({
@@ -30,6 +31,8 @@ const api = new Api({
 ;(async () => {
   let funnel
   let cycleFailures = 0
+  const { data: { ip } } = await axios('https://external-ip.now.sh')
+  const port = '9365'
   for (;;) {
     try {
       funnel = await updateFunnel()
@@ -65,7 +68,7 @@ const api = new Api({
         }
         // Successfully decrypted incoming and outgoing uris
         // console.log(incomingUri, outgoingUri)
-        await setFunnelUri(funnel, '192.168.1.3:9365')
+        await setFunnelUri(funnel, `${ip}:${port}`)
         const timer = setInterval(async () => {
           await updateFunnel(funnel)
         }, 5000)
