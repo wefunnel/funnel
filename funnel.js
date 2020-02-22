@@ -1,11 +1,20 @@
 const net = require('net')
-
-const remoteHost = '172.98.67.83'
-const remotePort = 502
+const { URL } = require('url')
 
 let remoteSocket
 
-const server = net.createServer((c) => {
+const [,,incomingIp, outgoingUri] = process.argv
+if (net.isIP(incomingIp) === 0) {
+  console.log('Incoming IP is invalid')
+  process.exit(1)
+}
+const [outgoingHost, outgoingPort] = outgoingUri.split(':')
+
+const funnelServer = net.createServer((c) => {
+  const { address, family, port } = c.address()
+  if (address.indexOf(incomingIp) === -1) {
+    return c.destroy()
+  }
   // c.setKeepAlive(true)
   console.log('TCP connection received')
   if (!remoteSocket) {
@@ -16,8 +25,8 @@ const server = net.createServer((c) => {
     })
     remoteSocket.setKeepAlive(true)
     remoteSocket.connect({
-      host: remoteHost,
-      port: remotePort,
+      host: outgoingHost,
+      port: outgoingPort,
     })
     remoteSocket.on('close', () => {
       remoteSocket.destroy()
@@ -63,11 +72,11 @@ const server = net.createServer((c) => {
   })
 })
 
-server.on('error', (err) => {
+funnelServer.on('error', (err) => {
   console.log('Server threw error', err)
 })
 
 const port = 9365
-server.listen(port, () => {
+funnelServer.listen(port, () => {
   console.log(`Server listening on port ${port}`)
 })
