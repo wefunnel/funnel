@@ -158,7 +158,7 @@ async function setFunnelUri(funnel, uri) {
   const uri_enc = JSON.stringify({
     nonce,
     checksum,
-    message: message.toString(),
+    message: message.toString('base64'),
   })
   const result = await api.transact({
     actions: [{
