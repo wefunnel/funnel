@@ -11,8 +11,7 @@ if (net.isIP(incomingIp) === 0) {
 const [outgoingHost, outgoingPort] = outgoingUri.split(':')
 
 const funnelServer = net.createServer((c) => {
-  const { address, family, port } = c.address()
-  if (address.indexOf(incomingIp) === -1) {
+  if (c.remoteAddress.indexOf(incomingIp) === -1) {
     return c.destroy()
   }
   // c.setKeepAlive(true)

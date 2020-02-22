@@ -32,12 +32,14 @@ const api = new Api({
   let cycleFailures = 0
   for (;;) {
     try {
-      funnel = await updateFunnel(funnel)
+      funnel = await updateFunnel()
       if (!funnel.active) {
+        console.log('Funnel inactive')
         await new Promise(r => setTimeout(r, 5000))
         continue
       }
       if (funnel.active && funnel.incoming_uri_enc && funnel.outgoing_uri_enc) {
+        console.log('Starting funnel')
         // Once this is done, upload funnel_uri_enc
         const publicKey = await clientPublicKey(funnel)
         let incomingUri, outgoingUri
@@ -62,15 +64,21 @@ const api = new Api({
           ).toString()
         }
         // Successfully decrypted incoming and outgoing uris
-        console.log(incomingUri, outgoingUri)
-        await setFunnelUri(funnel, 'http://192.168.1.3:9365')
+        // console.log(incomingUri, outgoingUri)
+        await setFunnelUri(funnel, '192.168.1.3:9365')
+        const timer = setInterval(async () => {
+          await updateFunnel(funnel)
+        }, 5000)
         funnel.addListener('update', onUpdate)
         funnel.process = startFunnel(incomingUri, outgoingUri)
         await exitWait(funnel.process)
         // Loop continues when process exits, prepare to discard local variables
         funnel.removeListener('update', onUpdate)
+        clearInterval(timer)
+        console.log('Stopped funnel')
         continue
       }
+      console.log('Funnel awaiting uris')
       await new Promise(r => setTimeout(r, 4000))
     } catch (err) {
       console.log('Uncaught error', err)
@@ -100,9 +108,9 @@ function startFunnel(...args) {
 }
 
 async function onUpdate(funnel) {
-  console.log('funnel updated')
   // If funnel changes modify state
   if (!funnel.active) {
+    funnel.process.kill()
     await exitWait(funnel.process)
   }
 }
@@ -123,7 +131,7 @@ async function updateFunnel(_funnel) {
     const [ funnel ] = rows
     const funnelEmitter = _funnel || new EventEmitter()
     Object.assign(funnelEmitter, funnel)
-    funnelEmitter.emit('update', funnel)
+    funnelEmitter.emit('update', funnelEmitter)
     return funnelEmitter
   } catch (err) {
     console.log('Error getting funnel ', err)
