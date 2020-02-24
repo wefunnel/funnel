@@ -69,8 +69,22 @@ const api = new Api({
         // Successfully decrypted incoming and outgoing uris
         // console.log(incomingUri, outgoingUri)
         await setFunnelUri(funnel, `${ip}:${port}`)
+        const maxFailures = 5
+        let funnelUpdateFailureCount = 0
         const timer = setInterval(async () => {
-          await updateFunnel(funnel)
+          try {
+            await updateFunnel(funnel)
+            funnelUpdateFailureCount = 0
+          } catch (err) {
+            funnelUpdateFailureCount += 1
+            if (funnelUpdateFailureCount >= maxFailures) {
+              console.log('Failed to update funnel ${maxFailures} times, exiting')
+              process.exit(1)
+            }
+            console.log(
+              `Error loading funnel info, retrying ${funnelUpdateFailureCount}/${maxFailures}`
+            )
+          }
         }, 5000)
         funnel.addListener('update', onUpdate)
         funnel.process = startFunnel(incomingUri, outgoingUri)
