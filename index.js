@@ -11,6 +11,8 @@ const fetch = require('node-fetch')
 const { Aes, PublicKey, ...ecc} = require('eosjs-ecc')
 const { Long } = require('bytebuffer')
 const axios = require('axios')
+const net = require('net')
+const _ = require('lodash')
 
 const rpc = new JsonRpc(process.env.EOS_RPC_URL, { fetch })
 const api = new Api({
@@ -18,6 +20,55 @@ const api = new Api({
   signatureProvider,
   textDecoder: new TextDecoder(),
   textEncoder: new TextEncoder(),
+})
+
+let tcpRoutes = []
+const connectionsByRouteId = {}
+
+const funnelServer = net.createServer((c) => {
+  const route = tcpRoutes.find(({ incoming }) => {
+    return c.remoteAddress.indexOf(incoming) !== -1
+  })
+  if (!route) {
+    return c.destroy()
+  }
+  console.log(`TCP Connection ${route.client} -> ${route.outgoing}`)
+  let remoteSocket = connectionsByRouteId[route.id]
+  if (!remoteSocket) {
+    remoteSocket = new net.Socket({
+      writable: true,
+      readable: true,
+    })
+    remoteSocket.setKeepAlive(true)
+    remoteSocket.connect({
+      host: route.outgoing.split(':')[0],
+      port: route.outgoing.split(':')[1]
+    })
+    connectionsByRouteId[route.id] = [ remoteSocket ]
+    remoteSocket.on('close', () => {
+      remoteSocket.destroy()
+      if (_.get(connectionsByRouteId, '[0]') === remoteSocket) {
+        for (const connection of connectionsByRouteId[route.id]) {
+          connection.destroy()
+        }
+        delete connectionsByRouteId[route.id]
+      }
+    })
+  }
+  c.pipe(remoteSocket)
+  remoteSocket.pipe(c)
+  c.on('end', () => {
+    remoteSocket.close()
+  })
+})
+
+funnelServer.on('error', (err) => {
+  console.log('Server threw error', err)
+})
+
+const port = 9365
+funnelServer.listen(port, () => {
+  console.log(`Server listening on port ${port}`)
 })
 
 /**
@@ -28,74 +79,47 @@ const api = new Api({
  * client: string
  **/
 
+function decryptData(publicKey, data) {
+  const { nonce, message, checksum } = JSON.parse(data)
+  return Aes.decrypt(
+    process.env.EOS_PRIVATE_KEY,
+    publicKey.toString(),
+    new Long(nonce.low, nonce.high, nonce.unsigned),
+    Buffer.from(message, 'base64'),
+    checksum
+  ).toString()
+}
+
+/**
+ * Main event loop
+ **/
 ;(async () => {
   let funnel
   let cycleFailures = 0
   const { data: { ip } } = await axios('https://external-ip.now.sh')
-  const port = '9365'
   for (;;) {
     try {
-      funnel = await updateFunnel()
-      if (!funnel.active) {
-        console.log('Funnel inactive')
-        await new Promise(r => setTimeout(r, 5000))
-        continue
+      funnel = await createOrUpdateFunnel()
+      const newRoutes = await loadRoutes()
+      const newRoutesById = _.keyBy(newRoutes, 'id')
+      const existingRoutesById = _.keyBy(tcpRoutes, 'id')
+      for (const oldRoute of tcpRoutes) {
+        if (newRoutesById[oldRoute.id]) continue // No change
+        // Otherwise remove, kill TCP sockets
+        if (!connectionsByRouteId[oldRoute.id]) continue
+        connectionsByRouteId[oldRoute.id].map(
+          (connection) => connection.close()
+        )
       }
-      if (funnel.active && funnel.incoming_uri_enc && funnel.outgoing_uri_enc) {
-        console.log('Starting funnel')
-        // Once this is done, upload funnel_uri_enc
-        const publicKey = await clientPublicKey(funnel)
-        let incomingUri, outgoingUri
-        {
-          const { nonce, message, checksum } = JSON.parse(funnel.incoming_uri_enc)
-          incomingUri = Aes.decrypt(
-            process.env.EOS_PRIVATE_KEY,
-            publicKey.toString(),
-            new Long(nonce.low, nonce.high, nonce.unsigned),
-            Buffer.from(message, 'base64'),
-            checksum
-          ).toString()
+      for (const newRoute of newRoutes) {
+        if (existingRoutesById[newRoute.id]) continue // No change
+        // Otherwise post encrypted connection info
+        if (!newRoute.funnel_uri_enc) {
+          await setFunnelUri(newRoute.client, `${ip}:${port}`)
         }
-        {
-          const { nonce, message, checksum } = JSON.parse(funnel.outgoing_uri_enc)
-          outgoingUri = Aes.decrypt(
-            process.env.EOS_PRIVATE_KEY,
-            publicKey.toString(),
-            new Long(nonce.low, nonce.high, nonce.unsigned),
-            Buffer.from(message, 'base64'),
-            checksum
-          ).toString()
-        }
-        // Successfully decrypted incoming and outgoing uris
-        // console.log(incomingUri, outgoingUri)
-        await setFunnelUri(funnel, `${ip}:${port}`)
-        const maxFailures = 5
-        let funnelUpdateFailureCount = 0
-        const timer = setInterval(async () => {
-          try {
-            await updateFunnel(funnel)
-            funnelUpdateFailureCount = 0
-          } catch (err) {
-            funnelUpdateFailureCount += 1
-            if (funnelUpdateFailureCount >= maxFailures) {
-              console.log('Failed to update funnel ${maxFailures} times, exiting')
-              process.exit(1)
-            }
-            console.log(
-              `Error loading funnel info, retrying ${funnelUpdateFailureCount}/${maxFailures}`
-            )
-          }
-        }, 5000)
-        funnel.addListener('update', onUpdate)
-        funnel.process = startFunnel(incomingUri, outgoingUri)
-        await exitWait(funnel.process)
-        // Loop continues when process exits, prepare to discard local variables
-        funnel.removeListener('update', onUpdate)
-        clearInterval(timer)
-        console.log('Stopped funnel')
-        continue
       }
-      console.log('Funnel awaiting uris')
+      tcpRoutes = newRoutes
+      console.log('Waiting to update...')
       await new Promise(r => setTimeout(r, 4000))
     } catch (err) {
       console.log('Uncaught error', err)
@@ -108,34 +132,10 @@ const api = new Api({
   }
 })()
 
-function startFunnel(...args) {
-  const p = fork(path.join(__dirname, './funnel.js'), args, {
-    cwd: __dirname,
-    detached: false,
-    stdio: [
-      0,
-      'pipe',
-      'pipe',
-      'ipc',
-    ]
-  })
-  p.stdout.on('data', (b) => console.log(b.toString()))
-  p.stderr.on('data', (b) => console.log('Error: ', b.toString()))
-  return p
-}
-
-async function onUpdate(funnel) {
-  // If funnel changes modify state
-  if (!funnel.active) {
-    funnel.process.kill()
-    await exitWait(funnel.process)
-  }
-}
-
 /**
  * Load funnel state from blockchain every 2 seconds
  **/
-async function updateFunnel(_funnel) {
+async function createOrUpdateFunnel(_funnel) {
   try {
     const { rows } = await rpc.get_table_rows({
       json: true,
@@ -145,6 +145,28 @@ async function updateFunnel(_funnel) {
       limit: 1,
       lower_bound: process.env.EOS_USERNAME,
     })
+    if (rows.length === 0) {
+      // funnel does not exist
+      await api.transact({
+        actions: [{
+          account: process.env.EOS_CONTRACT_NAME,
+          name: 'createfunnel',
+          authorization: [{
+            actor: process.env.EOS_USERNAME,
+            permission: 'active',
+          }],
+          data: {
+            owner: process.env.EOS_USERNAME,
+            rate: 10,
+            slots: 16,
+          }
+        }]
+      }, {
+        blocksBehind: 3,
+        expireSeconds: 30,
+      })
+      return await createOrUpdateFunnel()
+    }
     const [ funnel ] = rows
     const funnelEmitter = _funnel || new EventEmitter()
     Object.assign(funnelEmitter, funnel)
@@ -156,14 +178,47 @@ async function updateFunnel(_funnel) {
   }
 }
 
-async function clientPublicKey(funnel) {
-  const { permissions } = await rpc.get_account(funnel.client)
+async function loadRoutes() {
+  const _loadRoutes = async () => await rpc.get_table_rows({
+    json: true,
+    code: process.env.EOS_CONTRACT_NAME,
+    scope: process.env.EOS_CONTRACT_NAME,
+    table: 'routes',
+    limit: 20,
+    index_position: 'fourth',
+    key_type: 'i64',
+    upper_bound: process.env.EOS_USERNAME,
+    lower_bound: process.env.EOS_USERNAME,
+  })
+  const routes = []
+  let more = true
+  while (more) {
+    const { rows, more: _more } = await _loadRoutes()
+    routes.push(...rows)
+    more = _more
+  }
+  // For each one decrypt the incoming and outgoing uris
+  return await Promise.all(routes.map(async (route) => {
+    const publicKey = await clientPublicKey(route.client)
+    let incoming, outgoing
+    if (route.incoming_uri_enc) {
+      incoming = decryptData(publicKey, route.incoming_uri_enc)
+    }
+    if (route.outgoing_uri_enc) {
+      outgoing = decryptData(publicKey, route.outgoing_uri_enc)
+    }
+    return { ...route, incoming, outgoing }
+  }))
+}
+
+async function clientPublicKey(username) {
+  const { permissions } = await rpc.get_account(username)
   const ownerPerm = permissions.find((perm) => perm.perm_name === 'owner')
   return PublicKey(ownerPerm.required_auth.keys[0].key)
 }
 
-async function setFunnelUri(funnel, uri) {
-  const public = await clientPublicKey(funnel)
+async function setFunnelUri(client, uri) {
+  const public = await clientPublicKey(client)
   const { nonce, message, checksum } = Aes.encrypt(
     process.env.EOS_PRIVATE_KEY,
     public,
@@ -183,22 +238,13 @@ async function setFunnelUri(funnel, uri) {
         permission: 'active',
       }],
       data: {
-        username: process.env.EOS_USERNAME,
+        owner: process.env.EOS_USERNAME,
+        client,
         uri: uri_enc,
       }
     }]
   }, {
     blocksBehind: 3,
     expireSeconds: 30,
-  })
-  // console.log(result)
-}
-
-async function exitWait(p) {
-  await new Promise((rs, rj) => {
-    p.on('exit', (code) => {
-      if (code !== null && code !== 0) rj()
-      else rs()
-    })
   })
 }
